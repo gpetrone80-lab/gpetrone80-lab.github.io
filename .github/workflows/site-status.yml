@@ -1,0 +1,90 @@
+# Feeds the "Site Status Board" dashboard.
+# - Every 15 minutes: pings each Netlify site. The dashboard reads these pings
+#   back through Netlify's request logs (user agent below), so it shows
+#   up/down and response time even when no one has visited a site.
+#   A failed ping fails the run, so GitHub emails you when a site is down.
+# - Once a day: writes a snapshot of every repository (last build, last push,
+#   Pages, open PRs) to the status-data branch, which the dashboard loads.
+name: Site status
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # uptime pings
+    - cron: "17 10 * * *"    # daily GitHub snapshot (5:17 AM Eastern)
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "What to run"
+        type: choice
+        options: [both, uptime, snapshot]
+        default: both
+
+permissions:
+  contents: write
+
+concurrency:
+  group: site-status-${{ github.event.schedule || github.event.inputs.job }}
+  cancel-in-progress: false
+
+env:
+  SITES: >-
+    nestboard-913fc6e5.netlify.app
+    willowy-smakager-61c7bf.netlify.app
+    phfr-cad-dashboard.netlify.app
+    incredible-narwhal-64876a.netlify.app
+    dgh-tax-consultants.netlify.app
+  PROBE_UA: SiteStatusBoard-Uptime/1.0 (+github.com/gpetrone80-lab/gpetrone80-lab.github.io)
+
+jobs:
+  uptime:
+    if: github.event.schedule == '*/15 * * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.job != 'snapshot')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping each site
+        run: |
+          down=0
+          echo "| Site | Status | Response time |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for s in $SITES; do
+            out=$(curl -sS -o /dev/null -L --max-time 20 --retry 1 --retry-delay 5 \
+              -A "$PROBE_UA" -H "Cache-Control: no-cache" \
+              -w "%{http_code} %{time_total}" "https://$s/" 2>/dev/null) || out="000 0"
+            code=${out% *}; secs=${out#* }
+            ms=$(awk "BEGIN{printf \"%d\", $secs*1000}")
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then st="up"; else st="DOWN"; down=$((down+1)); fi
+            echo "$s $st $code ${ms}ms"
+            echo "| $s | $st ($code) | ${ms} ms |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [ "$down" -gt 0 ]; then echo "::error::$down site(s) down"; exit 1; fi
+
+  snapshot:
+    if: github.event.schedule == '17 10 * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.job != 'uptime')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/site-status
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build the snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          EXTRA_REPOS: overtime
+        run: node .github/site-status/snapshot.mjs > /tmp/github-repos.json
+      - name: Save it to the status-data branch
+        run: |
+          cd "$RUNNER_TEMP"
+          git init -q data && cd data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git checkout -q --orphan status-data
+          cp /tmp/github-repos.json github-repos.json
+          printf '# Status data\n\nWritten once a day by the Site status workflow for the Site Status Board dashboard. Not part of the website.\n' > README.md
+          git add -A
+          git commit -q -m "GitHub snapshot $(date -u +%F)"
+          git push -q -f origin status-data
